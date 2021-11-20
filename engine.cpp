@@ -378,13 +378,13 @@ normal_map_layer create_normal_map_layer(const image_data& image, float scale = 
     return result;
 }
 
-uint32_t* regenerate_normal_map_layers(std::vector<normal_map_layer>& layers, const image_data& albedoImage, int flipY)
+uint32_t* regenerate_normal_map_layers(std::vector<normal_map_layer>& layers, const image_data& albedoImage, bool flipY)
 {
     for (auto& layer : layers) {
         if (layer.image.data) {
             free(layer.image.data);
         }
-        layer.image = generate_normal_map(albedoImage, layer.scale, layer.blurPasses, layer.greyscaleType, flipY);
+        layer.image = generate_normal_map(albedoImage, layer.scale, layer.blurPasses, layer.greyscaleType, (int)flipY);
         nk_glfw3_destroy_texture(layer.nkTextureId);
         layer.nkTextureId = nk_glfw3_create_texture(layer.image.data, layer.image.w, layer.image.h);
         layer.nkImage = nk_image_id(layer.nkTextureId);
@@ -434,25 +434,6 @@ int main()
     normalMapLayers.push_back(create_normal_map_layer(normalMapResult));
 
     GLuint program = glsys::create_program_from_files("shaders/shader.vert", "shaders/shader.frag");
-
-    GLuint vao, vbo;
-    glGenVertexArrays(1, &vao);
-    glBindVertexArray(vao);
-
-    glGenBuffers(1, &vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof_vector(vertices), vertices.data(), GL_STATIC_DRAW);
-
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(vertices[0]), static_cast<void*>(0));
-    glEnableVertexAttribArray(0);
-
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(vertices[0]), reinterpret_cast<void*>(sizeof(float) * 3));
-    glEnableVertexAttribArray(1);
-
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(vertices[0]), reinterpret_cast<void*>(sizeof(float) * 6));
-    glEnableVertexAttribArray(2);
-
-    assert(!glsys::report_errors());
 
     sinm_greyscale_type selectedGreyscaleOption = sinm_greyscale_lightness;
     const char* greyscaleOptionNames[sinm_greyscale_count] = { "average", "luminance", "lightness", "none" };
