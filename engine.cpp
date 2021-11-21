@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
@@ -59,6 +60,13 @@
 
 #define MAX_VERTEX_BUFFER 512 * 1024
 #define MAX_ELEMENT_BUFFER 128 * 1024
+
+#define BEGIN_TIMER(name) \
+    std::chrono::steady_clock::time_point name##begin = std::chrono::steady_clock::now();
+
+#define END_TIMER(name)                                                                 \
+    std::chrono::steady_clock::time_point name##end = std::chrono::steady_clock::now(); \
+    fmt::print("{} took {} miliseconds\n", #name, std::chrono::duration_cast<std::chrono::milliseconds>(name##end - name##begin).count());
 
 #define exit_message(message)          \
     do {                               \
@@ -295,36 +303,27 @@ struct render_object {
 
 struct image_data {
     int32_t w, h;
-    uint32_t* data;
+    std::vector<uint32_t> pixels;
 };
 
 image_data load_image(const char* filepath)
 {
     image_data result;
-    result.data = reinterpret_cast<uint32_t*>(stbi_load(filepath, &result.w, &result.h, nullptr, 4));
-
-    if (!result.data) {
+    uint32_t* data = reinterpret_cast<uint32_t*>(stbi_load(filepath, &result.w, &result.h, nullptr, 4));
+    if (!data) {
         fmt::print(stderr, "failed to load image {}\n", filepath);
         assert(false);
     }
 
-    return result;
-}
+    //TODO: use automatic memory management with this copy
+    result.pixels.reserve(result.w * result.h);
+    //std::copy(data, &data[result.w * result.h], std::back_inserter(result.pixels));
+    memcpy(result.pixels.data(), data, result.w * result.h * sizeof(uint32_t));
+    //std::copy(data, &data[result.w * result.h], result.pixels);
 
-image_data generate_normal_map(const image_data& image, float scale, int blurPasses, sinm_greyscale_type greyscaleType, int flipY = 0)
-{
-    image_data result = { image.w, image.h, nullptr };
-    result.data = sinm_normal_map(image.data, image.w, image.h, scale, (int)blurPasses, greyscaleType, flipY);
-    return result;
-}
+    stbi_image_free(data);
 
-void free_image_data(image_data& image)
-{
-    if (image.data) {
-        stbi_image_free(image.data);
-    }
-    image.w = 0;
-    image.h = 0;
+    return result;
 }
 
 GLFWwindow* initialize_glfw()
@@ -366,45 +365,68 @@ struct normal_map_layer {
     struct nk_image nkImage;
 };
 
-normal_map_layer create_normal_map_layer(const image_data& image, float scale = 1.0f, int blurPasses = 2, sinm_greyscale_type greyscaleType = sinm_greyscale_luminance, int flipY = 0)
+image_data generate_normal_map(const image_data& image, float scale, int blurPasses, sinm_greyscale_type greyscaleType, int flipY = 0)
+{
+    image_data result = { image.w, image.h };
+    result.pixels.resize(image.w * image.h);
+    sinm_normal_map_buffer(image.pixels.data(), result.pixels.data(), image.w, image.h, scale, (int)blurPasses, greyscaleType, flipY);
+    return result;
+}
+
+normal_map_layer
+create_normal_map_layer(const image_data& image, float scale = 1.0f, int blurPasses = 2, sinm_greyscale_type greyscaleType = sinm_greyscale_luminance, int flipY = 0)
 {
     normal_map_layer result;
     result.scale = scale;
     result.blurPasses = blurPasses;
     result.greyscaleType = greyscaleType;
     result.image = generate_normal_map(image, result.scale, result.blurPasses, result.greyscaleType, flipY);
-    result.nkTextureId = nk_glfw3_create_texture(result.image.data, image.w, image.h);
+    result.nkTextureId = nk_glfw3_create_texture(result.image.pixels.data(), image.w, image.h);
     result.nkImage = nk_image_id(result.nkTextureId);
     return result;
 }
 
-uint32_t* regenerate_normal_map_layers(std::vector<normal_map_layer>& layers, const image_data& albedoImage, bool flipY)
+void regenerate_normal_map_layers(std::vector<normal_map_layer>& layers, const image_data& albedoImage, bool flipY)
 {
     for (auto& layer : layers) {
-        if (layer.image.data) {
-            free(layer.image.data);
-        }
         layer.image = generate_normal_map(albedoImage, layer.scale, layer.blurPasses, layer.greyscaleType, (int)flipY);
         nk_glfw3_destroy_texture(layer.nkTextureId);
-        layer.nkTextureId = nk_glfw3_create_texture(layer.image.data, layer.image.w, layer.image.h);
+        layer.nkTextureId = nk_glfw3_create_texture(layer.image.pixels.data(), layer.image.w, layer.image.h);
         layer.nkImage = nk_image_id(layer.nkTextureId);
     }
+}
 
-    uint32_t* composite = layers[0].image.data;
-    if (layers.size() > 1) {
-        uint32_t* prev;
-        for (int i = 1; i < layers.size(); ++i) {
-            auto image = layers[i].image;
-            prev = composite;
-            composite = sinm_composite_alloc(composite, image.data, image.w, image.h);
-            if (i >= 2) { //NOTE: prev will be pointing at data we don't want to free first loop
-                free(prev);
-            }
-        }
-        sinm_normalize(composite, albedoImage.w, albedoImage.h, 1.0f, false);
+image_data generate_normal_map_composite(const std::vector<normal_map_layer>& layers)
+{
+    if (layers.size() == 0) {
+        assert(false);
+        return {};
     }
 
-    return composite;
+    image_data result = { layers[0].image.w, layers[0].image.h };
+    result.pixels.resize(layers[0].image.pixels.size());
+    if (layers.size() == 1) {
+        memcpy(result.pixels.data(), layers[0].image.pixels.data(), result.w * result.h * sizeof(uint32_t));
+    } else {
+        std::vector<std::vector<uint32_t>> composites(layers.size() - 1);
+
+        for (auto& c : composites) {
+            c.reserve(result.w * result.h);
+        }
+        memcpy(composites[0].data(), layers[0].image.pixels.data(), result.w * result.h * sizeof(uint32_t));
+
+        for (int i = 1; i < layers.size(); ++i) {
+            auto image = layers[i].image;
+            if (i == (layers.size() - 1)) {
+                sinm_composite(composites[i - 1].data(), image.pixels.data(), result.pixels.data(), image.w, image.h);
+            } else {
+                sinm_composite(composites[i - 1].data(), image.pixels.data(), composites[i].data(), image.w, image.h);
+            }
+        }
+        sinm_normalize(result.pixels.data(), result.w, result.h, 1.0f, false);
+    }
+
+    return result;
 }
 
 int main()
@@ -421,19 +443,17 @@ int main()
         nk_style_set_font(ctx, &clean->handle);
     }
 
-    image_data albedoImage = load_image("../textures/broken_tiles_01.tga");
-    image_data normalMapResult = generate_normal_map(albedoImage, 1.0f, 4, sinm_greyscale_average, false);
-
-    int albedoMapTexIndex = nk_glfw3_create_texture(albedoImage.data, albedoImage.w, albedoImage.h);
-    struct nk_image albedoMapImage = nk_image_id(albedoMapTexIndex);
-
-    int normalMapResultTexIndex = nk_glfw3_create_texture(normalMapResult.data, normalMapResult.w, normalMapResult.h);
-    struct nk_image normalMapResultImage = nk_image_id(normalMapResultTexIndex);
+    image_data albedoImage = load_image("textures/broken_tiles_01.tga");
 
     std::vector<normal_map_layer> normalMapLayers;
-    normalMapLayers.push_back(create_normal_map_layer(normalMapResult));
+    normalMapLayers.push_back(create_normal_map_layer(albedoImage));
+    image_data normalMapResult = generate_normal_map_composite(normalMapLayers);
 
-    GLuint program = glsys::create_program_from_files("shaders/shader.vert", "shaders/shader.frag");
+    int albedoMapTexIndex = nk_glfw3_create_texture(albedoImage.pixels.data(), albedoImage.w, albedoImage.h);
+    struct nk_image albedoMapImage = nk_image_id(albedoMapTexIndex);
+
+    int normalMapResultTexIndex = nk_glfw3_create_texture(normalMapResult.pixels.data(), normalMapResult.w, normalMapResult.h);
+    struct nk_image normalMapResultImage = nk_image_id(normalMapResultTexIndex);
 
     sinm_greyscale_type selectedGreyscaleOption = sinm_greyscale_lightness;
     const char* greyscaleOptionNames[sinm_greyscale_count] = { "average", "luminance", "lightness", "none" };
@@ -468,8 +488,14 @@ int main()
 
             nk_layout_row_static(ctx, 30, 80, 1);
             if (nk_button_label(ctx, "Apply")) {
-                normalMapResult.data = regenerate_normal_map_layers(normalMapLayers, albedoImage, flipY);
-                normalMapResultTexIndex = nk_glfw3_create_texture(normalMapResult.data, normalMapResult.w, normalMapResult.h);
+                BEGIN_TIMER(regenerate)
+                regenerate_normal_map_layers(normalMapLayers, albedoImage, flipY);
+                END_TIMER(regenerate)
+                BEGIN_TIMER(compositing)
+                normalMapResult = generate_normal_map_composite(normalMapLayers);
+                END_TIMER(compositing)
+
+                normalMapResultTexIndex = nk_glfw3_create_texture(normalMapResult.pixels.data(), normalMapResult.w, normalMapResult.h);
                 normalMapResultImage = nk_image_id(normalMapResultTexIndex);
             }
 
@@ -479,7 +505,7 @@ int main()
             nk_layout_row_static(ctx, 30, 80, 1);
             nk_style_button button = {};
             if (nk_button_label(ctx, "Save")) {
-                stbi_write_png(filenameInputBuffer, normalMapResult.w, normalMapResult.h, 4, normalMapResult.data, 0);
+                stbi_write_png(filenameInputBuffer, normalMapResult.w, normalMapResult.h, 4, normalMapResult.pixels.data(), 0);
             }
 
             nk_layout_row_static(ctx, 30, 250, 1);
@@ -489,10 +515,9 @@ int main()
         }
         nk_end(ctx);
 
-        /* Bindless Texture */
-        int i = 0;
+        int layerNumber = 0;
         for (auto& layer : normalMapLayers) {
-            std::string name = fmt::format("Layer {}", i++);
+            std::string name = fmt::format("Layer {}", layerNumber++);
             if (nk_begin(ctx, name.c_str(), nk_rect(250, 150, 230, 250),
                     NK_WINDOW_BORDER | NK_WINDOW_MOVABLE | NK_WINDOW_SCALABLE | NK_WINDOW_MINIMIZABLE | NK_WINDOW_TITLE)) {
 
@@ -504,6 +529,7 @@ int main()
 
                 struct nk_command_buffer* canvas = nk_window_get_canvas(ctx);
                 struct nk_rect total_space = nk_window_get_content_region(ctx);
+
                 total_space.y += 80;
                 total_space.h -= 80;
                 total_space.w = total_space.h;
@@ -530,17 +556,9 @@ int main()
         nk_glfw3_render(NK_ANTI_ALIASING_ON);
         glfwSwapBuffers(window);
 
-#if 0
-        if (prevBlurRadius != largeDetailBlurRadius) {
-            normalMapResult.data = regenerate_normal_map_layers(normalMapLayers, albedoImage, flipY);
-            normalMapResultTexIndex = nk_glfw3_create_texture(normalMapResult.data, normalMapResult.w, normalMapResult.h);
-            normalMapResultImage = nk_image_id(normalMapResultTexIndex);
-        }
-#endif
-
         assert(!glsys::report_errors());
     }
-    free_image_data(albedoImage);
+
     nk_glfw3_shutdown();
     glfwDestroyWindow(window);
     glfwTerminate();
