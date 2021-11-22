@@ -55,6 +55,13 @@ typedef enum {
     sinm_greyscale_luminance,
     sinm_greyscale_count, //Used for iterating, not a valid option
 } sinm_greyscale_type;
+
+#ifdef SI_NORMALMAP_GPU
+typedef struct {
+    uint32_t fbo, buffer;
+} sinm_gpu_buffer;
+#endif
+
 #endif //SINM_TYPES
 
 #ifndef SI_NORMALMAP_IMPLEMENTATION
@@ -380,13 +387,14 @@ typedef struct
     uint32_t greyscaleLightnessShader;
     uint32_t blurShader;
     uint32_t normalMapShader;
+    uint32_t normalizeShader;
+    uint32_t compositeShader;
 } sinm__opengl_ctx;
 
 static sinm__opengl_ctx sinm__glCtx = { 0 };
 
-//TODO optimize
 SINM_DEF void
-sinm__gaussian_box_opengl(const uint32_t* in, uint32_t* out, int32_t w, int32_t h, float scale, float r, sinm_greyscale_type greyscaleType, int flipY = 0)
+sinm_initialize_opengl()
 {
     const float quadVertices[] = {
         // positions        // texture Coords
@@ -409,19 +417,6 @@ sinm__gaussian_box_opengl(const uint32_t* in, uint32_t* out, int32_t w, int32_t 
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
         glEnableVertexAttribArray(1);
         glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
-
-        glGenFramebuffers(2, sinm__glCtx.pingpongFBO);
-        glGenTextures(2, sinm__glCtx.pingpongBuffers);
-        for (unsigned int i = 0; i < 2; i++) {
-            glBindFramebuffer(GL_FRAMEBUFFER, sinm__glCtx.pingpongFBO[i]);
-            glBindTexture(GL_TEXTURE_2D, sinm__glCtx.pingpongBuffers[i]);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA, GL_FLOAT, NULL);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sinm__glCtx.pingpongBuffers[i], 0);
-        }
 
         GLuint vShader = glsys::create_shader(GL_VERTEX_SHADER, sinm__gaussian_blur_vert_shader_source);
 
@@ -468,16 +463,119 @@ sinm__gaussian_box_opengl(const uint32_t* in, uint32_t* out, int32_t w, int32_t 
             sinm__glCtx.normalMapShader = program;
         }
 
+        {
+            std::string fCode = fsys::read_file<std::string>("shaders/normalize.frag");
+            GLuint fShader = glsys::create_shader(GL_FRAGMENT_SHADER, fCode);
+            GLuint program = glsys::create_program(vShader, fShader);
+            assert(program != 0);
+            sinm__glCtx.normalizeShader = program;
+        }
+
+        {
+            std::string fCode = fsys::read_file<std::string>("shaders/composite.frag");
+            GLuint fShader = glsys::create_shader(GL_FRAGMENT_SHADER, fCode);
+            GLuint program = glsys::create_program(vShader, fShader);
+            assert(program != 0);
+            sinm__glCtx.compositeShader = program;
+        }
         sinm__glCtx.initialized = 1;
         assert(!glsys::report_errors());
     }
+}
+
+//NOTE: GPU -> RAM copy is slow. Only use this function if you really need to(such as writing the data to a file)
+SINM_DEF void
+sinm_gpu_normal_map_to_buffer(uint32_t* out, uint32_t inFBO, int32_t w, int32_t h)
+{
+    assert(inFBO != 0); //opengl context not initialized
+    assert(out);
+    assert(w > 0 && h > 0);
+
+    BEGIN_TIMER(gpu_to_buffer_copy)
+    glBindFramebuffer(GL_FRAMEBUFFER, inFBO);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, out);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    END_TIMER(gpu_to_buffer_copy)
+}
+
+SINM_DEF void
+sinm_composite_gpu(sinm_gpu_buffer outBuffer, const sinm_gpu_buffer* inBuffers, int32_t count, int32_t w, int32_t h)
+{
+    assert(inBuffers);
+
+    if (count <= 1) {
+        return;
+    }
+
+    count = sinm__min(5, count);
+    glUseProgram(sinm__glCtx.compositeShader);
+    glViewport(0, 0, w, h);
+
+#define MAX_COMPOSITE_LAYERS 5
+    int texUnis[MAX_COMPOSITE_LAYERS] = {};
+    texUnis[0] = glGetUniformLocation(sinm__glCtx.compositeShader, "images[0]");
+    texUnis[1] = glGetUniformLocation(sinm__glCtx.compositeShader, "images[1]");
+    texUnis[2] = glGetUniformLocation(sinm__glCtx.compositeShader, "images[2]");
+    texUnis[3] = glGetUniformLocation(sinm__glCtx.compositeShader, "images[3]");
+    texUnis[4] = glGetUniformLocation(sinm__glCtx.compositeShader, "images[4]");
+    for (int i = 0; i < count; ++i) {
+        glUniform1i(texUnis[i], i);
+    }
+
+    glUniform1i(glGetUniformLocation(sinm__glCtx.compositeShader, "numImages"), count);
+
+    glBindVertexArray(sinm__glCtx.quadVAO);
+    assert(!glsys::report_errors());
+
+    assert(!glsys::report_errors());
+    glBindFramebuffer(GL_FRAMEBUFFER, outBuffer.fbo);
+    for (int i = 0; i < count; ++i) {
+        glActiveTexture(GL_TEXTURE0 + i);
+        assert(!glsys::report_errors());
+        uint32_t buffer = inBuffers[i].buffer;
+        glBindTexture(GL_TEXTURE_2D, buffer);
+        assert(!glsys::report_errors());
+    }
+    assert(!glsys::report_errors());
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    assert(!glsys::report_errors());
+
+    glActiveTexture(GL_TEXTURE0);
+    assert(!glsys::report_errors());
+    glBindTexture(GL_TEXTURE_2D, 0);
+    assert(!glsys::report_errors());
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    assert(!glsys::report_errors());
+}
+
+//TODO optimize
+SINM_DEF void
+sinm__normal_map_gpu(const uint32_t* inBuffer, uint32_t outFBO, int32_t w, int32_t h, float scale, int numBlurPasses, sinm_greyscale_type greyscaleType, int flipY = 0)
+{
+    assert(sinm__glCtx.initialized);
+    assert(outFBO != 0);
+    assert(inBuffer);
 
     glBindTexture(GL_TEXTURE_2D, sinm__glCtx.inTex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, in);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, inBuffer);
+
+    glGenFramebuffers(2, sinm__glCtx.pingpongFBO);
+    glGenTextures(2, sinm__glCtx.pingpongBuffers);
+    for (unsigned int i = 0; i < 2; i++) {
+        glBindFramebuffer(GL_FRAMEBUFFER, sinm__glCtx.pingpongFBO[i]);
+        glBindTexture(GL_TEXTURE_2D, sinm__glCtx.pingpongBuffers[i]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, w, h, 0, GL_RGBA, GL_FLOAT, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sinm__glCtx.pingpongBuffers[i], 0);
+    }
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
@@ -512,10 +610,10 @@ sinm__gaussian_box_opengl(const uint32_t* in, uint32_t* out, int32_t w, int32_t 
         GLint horizontalUni = glGetUniformLocation(sinm__glCtx.blurShader, "horizontal");
         glUniform1i(texUni, 0);
 
-        int passes = (int)r;
+        int blurPasses = sinm__max(2, numBlurPasses * 2);
         int horizontal = 1;
         int firstIteration = 1;
-        for (int i = 0; i < passes; ++i) {
+        for (int i = 0; i < blurPasses; ++i) {
             glBindFramebuffer(GL_FRAMEBUFFER, sinm__glCtx.pingpongFBO[horizontal]);
             glUniform1i(horizontalUni, horizontal);
             glBindTexture(GL_TEXTURE_2D, sinm__glCtx.pingpongBuffers[!horizontal]);
@@ -536,18 +634,13 @@ sinm__gaussian_box_opengl(const uint32_t* in, uint32_t* out, int32_t w, int32_t 
         float yDir = (flipY) ? -1.0f : 1.0f;
 
         glUniform1f(flipYUni, yDir);
-        glBindFramebuffer(GL_FRAMEBUFFER, sinm__glCtx.pingpongFBO[0]);
+        glBindFramebuffer(GL_FRAMEBUFFER, outFBO);
         glBindTexture(GL_TEXTURE_2D, sinm__glCtx.pingpongBuffers[1]);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         assert(!glsys::report_errors());
     }
     assert(!glsys::report_errors());
 
-    BEGIN_TIMER(blur_copy)
-    glBindFramebuffer(GL_FRAMEBUFFER, sinm__glCtx.pingpongFBO[0]);
-    glReadBuffer(GL_COLOR_ATTACHMENT0);
-    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, out);
-    END_TIMER(blur_copy)
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glUseProgram(0);
 }
@@ -588,33 +681,6 @@ sinm__sobel3x3_normals_row_range(const uint32_t* in, uint32_t* out, int32_t xs, 
         }
     }
 }
-
-#if 0
-static sinm__inline void
-sinm__sobel3x3_normals_gpu(const uint32_t* in, uint32_t* out, int32_t w, int32_t h, float scale, int flipY)
-{
-    uint32_t pbo;
-    glGenBuffers(1, &pbo);
-    glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
-    glBufferData(GL_PIXEL_PACK_BUFFER, w * h * sizeof(uint32_t), 0, GL_STREAM_READ);
-
-    glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
-    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    //glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo[1]);
-    uint32_t* data = (uint32_t*)glMapBuffer(GL_PIXEL_PACK_BUFFER, GL_READ_ONLY);
-    if (data) {
-        memcpy(out, data, w * h * sizeof(uint32_t));
-        data = nullptr;
-        glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
-    }
-    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-    //glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, out);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glDeleteFramebuffersEXT(1, &fbo);
-    glDeleteTextures(1, &inTex);
-    glUseProgram(0);
-}
-#endif
 
 static sinm__inline void
 sinm__sobel3x3_normals(const uint32_t* in, uint32_t* out, int32_t w, int32_t h, float scale, int flipY)
@@ -937,34 +1003,20 @@ sinm_normal_map_buffer(const uint32_t* in, uint32_t* out, int32_t w, int32_t h, 
 
     if (intermediate) {
         BEGIN_TIMER(greyscale)
-        //if (greyscaleType != sinm_greyscale_none) {
-        //   sinm_greyscale(in, out, w, h, greyscaleType);
-        //} else {
-        //    memcpy(out, in, w * h * sizeof(uint32_t));
-        //}
+        if (greyscaleType != sinm_greyscale_none) {
+            sinm_greyscale(in, out, w, h, greyscaleType);
+        } else {
+            memcpy(out, in, w * h * sizeof(uint32_t));
+        }
         END_TIMER(greyscale)
 
         float radius = sinm__min(sinm__min(w, h), sinm__max(0, blurRadius));
         if (radius >= 1.0f) {
-#ifdef SI_NORMALMAP_GPU
-            BEGIN_TIMER(blur_gpu)
-            int r = (int)radius;
-            r = sinm__max(2, r * 2);
-            sinm__gaussian_box_opengl(in, intermediate, w, h, scale, r, greyscaleType, flipY);
-            END_TIMER(blur_gpu)
-#else
             sinm__gaussian_box(out, intermediate, w, h, radius);
-#endif
         } else {
             memcpy(intermediate, out, w * h * sizeof(uint32_t));
         }
 
-#ifdef SI_NORMALMAP_GPU
-        BEGIN_TIMER(normal_gen_gpu)
-        //sinm__sobel3x3_normals_gpu(intermediate, out, w, h, scale, flipY);
-        memcpy(out, intermediate, w * h * sizeof(uint32_t));
-        END_TIMER(normal_gen_gpu)
-#else
         //TODO: support using simd on non power of 2 images
         int32_t count = w * h;
         if (count % SINM_SIMD_WIDTH == 0) {
@@ -972,12 +1024,42 @@ sinm_normal_map_buffer(const uint32_t* in, uint32_t* out, int32_t w, int32_t h, 
         } else {
             sinm__sobel3x3_normals(intermediate, out, w, h, scale, flipY);
         }
-#endif
 
         free(intermediate);
         return 1;
     }
     return 0;
+}
+
+//Returns and opengl texture ID. To get the raw data use sinm_gpu_normal_map_to_buffer()
+//For best performance keep everything in GPU memory until you really need to access the data(such as writing it to a file)
+
+SINM_DEF sinm_gpu_buffer
+sinm_normal_map_gpu(const uint32_t* in, int32_t w, int32_t h, float scale, int numBlurPasses, sinm_greyscale_type greyscaleType, int flipY)
+{
+    assert(sinm__glCtx.initialized);
+    assert(w > 0 && h > 0);
+    assert(in);
+
+    scale = sinm__max(1.0f, scale);
+
+    sinm_gpu_buffer result = {};
+    glGenFramebuffers(1, &result.fbo);
+    glGenTextures(1, &result.buffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, result.fbo);
+    glBindTexture(GL_TEXTURE_2D, result.buffer);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, w, h, 0, GL_RGBA, GL_FLOAT, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, result.buffer, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    sinm__normal_map_gpu(in, result.fbo, w, h, scale, numBlurPasses, greyscaleType, flipY);
+
+    return result;
 }
 
 SINM_DEF sinm__inline uint32_t*

@@ -262,6 +262,18 @@ nk_glfw3_get_tex_ogl_handle(int tex_index)
 }
 
 NK_API int
+nk_glfw3_add_texture(const uint32_t textureId)
+{
+    struct nk_glfw_device* dev = &glfw.ogl;
+    int tex_index = nk_glfw3_get_available_tex_index();
+    dev->tex_ids[tex_index] = textureId;
+    GLuint64 handle = glGetTextureHandleARB(textureId);
+    glMakeTextureHandleResidentARB(handle);
+    dev->tex_handles[tex_index] = handle;
+    return tex_index;
+}
+
+NK_API int
 nk_glfw3_create_texture(const void* image, int width, int height)
 {
     GLuint id;
