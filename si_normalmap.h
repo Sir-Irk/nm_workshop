@@ -502,6 +502,7 @@ sinm_gpu_normal_map_to_buffer(uint32_t* out, uint32_t inFBO, int32_t w, int32_t 
 SINM_DEF void
 sinm_composite_gpu(sinm_gpu_buffer outBuffer, const sinm_gpu_buffer* inBuffers, int32_t count, int32_t w, int32_t h)
 {
+    assert(sinm__glCtx.initialized);
     assert(inBuffers);
 
     if (count <= 1) {
@@ -524,29 +525,18 @@ sinm_composite_gpu(sinm_gpu_buffer outBuffer, const sinm_gpu_buffer* inBuffers, 
     }
 
     glUniform1i(glGetUniformLocation(sinm__glCtx.compositeShader, "numImages"), count);
-
     glBindVertexArray(sinm__glCtx.quadVAO);
-    assert(!glsys::report_errors());
-
-    assert(!glsys::report_errors());
     glBindFramebuffer(GL_FRAMEBUFFER, outBuffer.fbo);
     for (int i = 0; i < count; ++i) {
         glActiveTexture(GL_TEXTURE0 + i);
-        assert(!glsys::report_errors());
         uint32_t buffer = inBuffers[i].buffer;
         glBindTexture(GL_TEXTURE_2D, buffer);
-        assert(!glsys::report_errors());
     }
-    assert(!glsys::report_errors());
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    assert(!glsys::report_errors());
 
     glActiveTexture(GL_TEXTURE0);
-    assert(!glsys::report_errors());
     glBindTexture(GL_TEXTURE_2D, 0);
-    assert(!glsys::report_errors());
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    assert(!glsys::report_errors());
 }
 
 //TODO optimize

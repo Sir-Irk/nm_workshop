@@ -439,8 +439,8 @@ int main()
         nk_style_set_font(ctx, &clean->handle);
     }
 
-    //image_data albedoImage = load_image("textures/broken_tiles_01.tga");
-    image_data albedoImage = load_image("textures/test_image.png");
+    image_data albedoImage = load_image("textures/broken_tiles_01.tga");
+    //image_data albedoImage = load_image("textures/test_image.png");
 
     std::vector<normal_map_layer> normalMapLayers;
     normalMapLayers.push_back(create_normal_map_layer(albedoImage));
@@ -499,9 +499,9 @@ int main()
 
             nk_layout_row_static(ctx, 30, 80, 1);
             if (nk_button_label(ctx, "Apply")) {
-                BEGIN_TIMER(regenerate)
+                // BEGIN_TIMER(regenerate)
                 regenerate_normal_map_layers(normalMapLayers, albedoImage, flipY);
-                END_TIMER(regenerate)
+                // END_TIMER(regenerate)
 
                 //normalMapResultTexIndex = nk_glfw3_create_texture(normalMapResult.pixels.data(), normalMapResult.w, normalMapResult.h);
                 //normalMapResultImage = nk_image_id(normalMapResultTexIndex);
@@ -560,9 +560,9 @@ int main()
 
         if (changedLayers.size() > 0) {
             regenerate_normal_map_layers(changedLayers, albedoImage, flipY);
-            BEGIN_TIMER(compositing)
+            //BEGIN_TIMER(compositing)
             generate_normal_map_composite(normalMap, normalMapLayers);
-            END_TIMER(compositing)
+            //END_TIMER(compositing)
         }
 
         if (nk_begin(ctx, "Albedo", nk_rect(500, 700, 230, 250),
